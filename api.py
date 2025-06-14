@@ -644,6 +644,19 @@ async def caldav_propfind(request: Request, credentials = Depends(get_calendar_c
         displayname = etree.SubElement(prop, "{DAV:}displayname")
         displayname.text = f"GAA Fixtures - Club {CLUB_ID}"
         
+        # Add supported calendar component set
+        comp_set = etree.SubElement(prop, "{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set")
+        comp_vevent = etree.SubElement(comp_set, "{urn:ietf:params:xml:ns:caldav}comp")
+        comp_vevent.set("name", "VEVENT")
+        
+        # Add calendar description
+        cal_desc = etree.SubElement(prop, "{urn:ietf:params:xml:ns:caldav}calendar-description")
+        cal_desc.text = f"GAA fixtures for club {CLUB_ID}"
+        
+        # Add content type
+        content_type = etree.SubElement(prop, "{DAV:}getcontenttype")
+        content_type.text = "text/calendar; charset=utf-8"
+        
         status = etree.SubElement(propstat, "{DAV:}status")
         status.text = "HTTP/1.1 200 OK"
         
