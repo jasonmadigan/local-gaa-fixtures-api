@@ -625,9 +625,10 @@ async def caldav_propfind(request: Request, credentials = Depends(get_calendar_c
     """Handle CalDAV PROPFIND requests"""
     try:
         # Create simple PROPFIND response
-        multistatus = etree.Element("{DAV:}multistatus")
-        multistatus.set("xmlns", "DAV:")
-        multistatus.set("{http://www.w3.org/2000/xmlns/}C", "urn:ietf:params:xml:ns:caldav")
+        multistatus = etree.Element("{DAV:}multistatus", nsmap={
+            None: "DAV:",
+            'C': "urn:ietf:params:xml:ns:caldav"
+        })
         
         response_elem = etree.SubElement(multistatus, "{DAV:}response")
         href = etree.SubElement(response_elem, "{DAV:}href")
@@ -684,9 +685,10 @@ async def caldav_report(request: Request, credentials = Depends(get_calendar_cre
             ical_content = calendar_response.content.decode('utf-8')
         
         # Create REPORT response
-        multistatus = etree.Element("{DAV:}multistatus")
-        multistatus.set("xmlns", "DAV:")
-        multistatus.set("{http://www.w3.org/2000/xmlns/}C", "urn:ietf:params:xml:ns:caldav")
+        multistatus = etree.Element("{DAV:}multistatus", nsmap={
+            None: "DAV:",
+            'C': "urn:ietf:params:xml:ns:caldav"
+        })
         
         response_elem = etree.SubElement(multistatus, "{DAV:}response")
         href = etree.SubElement(response_elem, "{DAV:}href")
@@ -718,8 +720,7 @@ async def caldav_report(request: Request, credentials = Depends(get_calendar_cre
     except Exception as e:
         print(f"REPORT error: {e}")
         # Return empty response on error
-        multistatus = etree.Element("{DAV:}multistatus")
-        multistatus.set("xmlns", "DAV:")
+        multistatus = etree.Element("{DAV:}multistatus", nsmap={None: "DAV:"})
         xml_content = etree.tostring(multistatus, encoding='utf-8', xml_declaration=True)
         
         return Response(
@@ -736,9 +737,10 @@ async def caldav_report(request: Request, credentials = Depends(get_calendar_cre
 async def caldav_root_propfind(request: Request, credentials = Depends(get_calendar_credentials)):
     """Handle root PROPFIND for CalDAV discovery"""
     try:
-        multistatus = etree.Element("{DAV:}multistatus")
-        multistatus.set("xmlns", "DAV:")
-        multistatus.set("{http://www.w3.org/2000/xmlns/}C", "urn:ietf:params:xml:ns:caldav")
+        multistatus = etree.Element("{DAV:}multistatus", nsmap={
+            None: "DAV:",
+            'C': "urn:ietf:params:xml:ns:caldav"
+        })
         
         response_elem = etree.SubElement(multistatus, "{DAV:}response")
         href = etree.SubElement(response_elem, "{DAV:}href")
