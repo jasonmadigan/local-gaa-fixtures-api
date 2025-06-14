@@ -14,7 +14,7 @@ from typing import List, Optional, Dict
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -613,6 +613,53 @@ def parse_gaa_datetime(date_str: str, time_str: str) -> datetime:
         
         date_obj = datetime.strptime(iso_date, "%Y-%m-%d")
         return date_obj.replace(hour=hour, minute=minute)
+
+@app.api_route("/fixtures/calendar.ics", methods=["PROPFIND"])
+async def caldav_propfind(request: Request, credentials = Depends(get_calendar_credentials)):
+    """Handle CalDAV PROPFIND requests"""
+    
+    # Basic CalDAV response for discovery
+    caldav_response = '''<?xml version="1.0" encoding="utf-8" ?>
+<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+    <response>
+        <href>/fixtures/calendar.ics</href>
+        <propstat>
+            <prop>
+                <resourcetype>
+                    <C:calendar/>
+                </resourcetype>
+                <displayname>GAA Fixtures - Club {club_id}</displayname>
+                <C:calendar-description>GAA fixtures for club {club_id}</C:calendar-description>
+                <getcontenttype>text/calendar</getcontenttype>
+                <C:supported-calendar-component-set>
+                    <C:comp name="VEVENT"/>
+                </C:supported-calendar-component-set>
+            </prop>
+            <status>HTTP/1.1 200 OK</status>
+        </propstat>
+    </response>
+</multistatus>'''.format(club_id=CLUB_ID)
+    
+    return Response(
+        content=caldav_response,
+        media_type="application/xml; charset=utf-8",
+        headers={
+            "DAV": "1, 2, 3, calendar-access",
+            "Content-Type": "application/xml; charset=utf-8"
+        }
+    )
+
+@app.api_route("/fixtures/calendar.ics", methods=["OPTIONS"])
+async def caldav_options(request: Request):
+    """Handle CalDAV OPTIONS requests"""
+    return Response(
+        content="",
+        headers={
+            "DAV": "1, 2, 3, calendar-access",
+            "Allow": "GET, HEAD, PUT, PROPFIND, OPTIONS, REPORT",
+            "Content-Type": "text/html; charset=utf-8"
+        }
+    )
 
 
 if __name__ == "__main__":
