@@ -191,45 +191,59 @@ curl -X POST "http://localhost:8000/fixtures/refresh"
 
 ## Home Assistant Integration
 
-### CalDAV Calendar Integration
+### Method 1: iCal Integration (Recommended)
 
 Add this to your Home Assistant `configuration.yaml`:
 
 ```yaml
 calendar:
-  - platform: caldav
-    url: http://your-gaa-api-server:8000/fixtures/calendar.ics
-    username: ""  # Leave empty for public calendar
-    password: ""  # Leave empty for public calendar
-    calendars:
-      - "GAA Fixtures"
-```
-
-### Alternative: HTTP Calendar
-
-```yaml
-calendar:
-  - platform: http
+  - platform: ical
     name: "GAA Fixtures"
     url: "http://your-gaa-api-server:8000/fixtures/calendar.ics"
 ```
 
-### Home/Away Calendars
+### Method 2: With Authentication (if needed)
 
-Create separate calendars for home and away games:
+If Home Assistant requires authentication, set environment variables and use:
+
+```bash
+# Set auth credentials
+export CALENDAR_USERNAME="gaa"
+export CALENDAR_PASSWORD="fixtures123"
+```
+
+Then in Home Assistant:
 
 ```yaml
 calendar:
   - platform: caldav
-    url: http://your-gaa-api-server:8000/fixtures/calendar.ics?venue=Tullogher
+    url: http://your-gaa-api-server:8000/fixtures/calendar.ics
+    username: gaa
+    password: fixtures123
     calendars:
-      - "GAA Home Fixtures"
-  
-  - platform: caldav  
-    url: http://your-gaa-api-server:8000/fixtures/calendar.ics?venue=!Tullogher
-    calendars:
-      - "GAA Away Fixtures"
+      - "GAA Fixtures"
 ```
+
+### Separate Home/Away Calendars
+
+```yaml
+calendar:
+  - platform: ical
+    name: "GAA Home Games"
+    url: "http://your-gaa-api-server:8000/fixtures/calendar.ics?venue=Tullogher"
+  
+  - platform: ical
+    name: "GAA Away Games" 
+    url: "http://your-gaa-api-server:8000/fixtures/calendar.ics"
+```
+
+### Troubleshooting
+
+If you get "failed to connect":
+1. **Try webcal protocol**: `webcal://your-server:8000/fixtures/calendar.ics`
+2. **Check URL accessibility**: Ensure Home Assistant can reach your API server
+3. **Use IP instead of hostname**: `http://192.168.1.100:8000/fixtures/calendar.ics`
+4. **Enable auth if needed**: Set `CALENDAR_USERNAME` and `CALENDAR_PASSWORD` environment variables
 
 ## Database Schema
 

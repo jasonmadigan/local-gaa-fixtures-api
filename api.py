@@ -14,11 +14,13 @@ from typing import List, Optional, Dict
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
 from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 import uvicorn
 from icalendar import Calendar, Event
+import secrets
 
 from gaa_fixtures_parser import GAAFixturesParser, parse_gaa_date
 
@@ -28,6 +30,30 @@ COUNTY_BOARD_ID = os.getenv("COUNTY_BOARD_ID", "15")
 DB_PATH = os.getenv("DB_PATH", "fixtures.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL_MINUTES", "60"))  # minutes
 PORT = int(os.getenv("PORT", "8000"))
+
+# Optional basic auth for calendar endpoint
+CALENDAR_USERNAME = os.getenv("CALENDAR_USERNAME", "gaa")
+CALENDAR_PASSWORD = os.getenv("CALENDAR_PASSWORD", "gaa")
+
+# Basic auth setup
+security = HTTPBasic()
+
+def get_calendar_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    """Verify calendar credentials if auth is enabled"""
+    if not CALENDAR_USERNAME or not CALENDAR_PASSWORD:
+        # No auth required
+        return True
+    
+    is_correct_username = secrets.compare_digest(credentials.username, CALENDAR_USERNAME)
+    is_correct_password = secrets.compare_digest(credentials.password, CALENDAR_PASSWORD)
+    
+    if not (is_correct_username and is_correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect calendar credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials
 
 # Pydantic models for API responses
 class FixtureResponse(BaseModel):
@@ -215,7 +241,8 @@ async def get_fixtures(
 @app.get("/fixtures/calendar.ics")
 async def get_fixtures_calendar(
     include_past: Optional[bool] = False,
-    venue: Optional[str] = None
+    venue: Optional[str] = None,
+    credentials = Depends(get_calendar_credentials)
 ):
     """Return fixtures as iCal format for CalDAV integration"""
     global parser
