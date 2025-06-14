@@ -14,14 +14,11 @@ from typing import List, Optional, Dict
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 import uvicorn
 from icalendar import Calendar, Event
-import secrets
-from lxml import etree
 
 from gaa_fixtures_parser import GAAFixturesParser, parse_gaa_date
 # from caldav_server import CalDAVServer  # Not using the separate CalDAV server
@@ -33,29 +30,7 @@ DB_PATH = os.getenv("DB_PATH", "fixtures.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL_MINUTES", "60"))  # minutes
 PORT = int(os.getenv("PORT", "8000"))
 
-# Optional basic auth for calendar endpoint
-CALENDAR_USERNAME = os.getenv("CALENDAR_USERNAME", "gaa")
-CALENDAR_PASSWORD = os.getenv("CALENDAR_PASSWORD", "gaa")
-
-# Basic auth setup
-security = HTTPBasic()
-
-def get_calendar_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify calendar credentials if auth is enabled"""
-    if not CALENDAR_USERNAME or not CALENDAR_PASSWORD:
-        # No auth required
-        return True
-    
-    is_correct_username = secrets.compare_digest(credentials.username, CALENDAR_USERNAME)
-    is_correct_password = secrets.compare_digest(credentials.password, CALENDAR_PASSWORD)
-    
-    if not (is_correct_username and is_correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect calendar credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials
+# No authentication required for local/home use
 
 # Pydantic models for API responses
 class FixtureResponse(BaseModel):
@@ -246,10 +221,9 @@ async def get_fixtures(
 @app.get("/fixtures/calendar.ics")
 async def get_fixtures_calendar(
     include_past: Optional[bool] = False,
-    venue: Optional[str] = None,
-    credentials = Depends(get_calendar_credentials)
+    venue: Optional[str] = None
 ):
-    """Return fixtures as iCal format for CalDAV integration"""
+    """Return fixtures as iCal format for Home Assistant Remote Calendar integration"""
     global parser
     
     if not parser:
@@ -348,8 +322,10 @@ async def get_fixtures_calendar(
             content=ical_content,
             media_type="text/calendar; charset=utf-8",
             headers={
-                "Content-Disposition": f"attachment; filename=gaa-fixtures-club-{CLUB_ID}.ics",
-                "Cache-Control": "max-age=3600"  # Cache for 1 hour
+                "Content-Disposition": f"inline; filename=gaa-fixtures-club-{CLUB_ID}.ics",
+                "Cache-Control": "max-age=1800",  # Cache for 30 minutes
+                "ETag": f'"gaa-fixtures-{CLUB_ID}-{len(fixtures)}"',
+                "Last-Modified": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
             }
         )
         
@@ -619,172 +595,7 @@ def parse_gaa_datetime(date_str: str, time_str: str) -> datetime:
         date_obj = datetime.strptime(iso_date, "%Y-%m-%d")
         return date_obj.replace(hour=hour, minute=minute)
 
-# CalDAV endpoints - simplified for debugging
-@app.api_route("/fixtures/calendar.ics", methods=["PROPFIND"])
-async def caldav_propfind(request: Request, credentials = Depends(get_calendar_credentials)):
-    """Handle CalDAV PROPFIND requests"""
-    try:
-        # Create simple PROPFIND response
-        multistatus = etree.Element("{DAV:}multistatus", nsmap={
-            None: "DAV:",
-            'C': "urn:ietf:params:xml:ns:caldav"
-        })
-        
-        response_elem = etree.SubElement(multistatus, "{DAV:}response")
-        href = etree.SubElement(response_elem, "{DAV:}href")
-        href.text = "/fixtures/calendar.ics"
-        
-        propstat = etree.SubElement(response_elem, "{DAV:}propstat")
-        prop = etree.SubElement(propstat, "{DAV:}prop")
-        
-        # Add calendar properties
-        resourcetype = etree.SubElement(prop, "{DAV:}resourcetype")
-        calendar = etree.SubElement(resourcetype, "{urn:ietf:params:xml:ns:caldav}calendar")
-        
-        displayname = etree.SubElement(prop, "{DAV:}displayname")
-        displayname.text = f"GAA Fixtures - Club {CLUB_ID}"
-        
-        # Add supported calendar component set
-        comp_set = etree.SubElement(prop, "{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set")
-        comp_vevent = etree.SubElement(comp_set, "{urn:ietf:params:xml:ns:caldav}comp")
-        comp_vevent.set("name", "VEVENT")
-        
-        # Add calendar description
-        cal_desc = etree.SubElement(prop, "{urn:ietf:params:xml:ns:caldav}calendar-description")
-        cal_desc.text = f"GAA fixtures for club {CLUB_ID}"
-        
-        # Add content type
-        content_type = etree.SubElement(prop, "{DAV:}getcontenttype")
-        content_type.text = "text/calendar; charset=utf-8"
-        
-        status = etree.SubElement(propstat, "{DAV:}status")
-        status.text = "HTTP/1.1 200 OK"
-        
-        xml_content = etree.tostring(multistatus, encoding='utf-8', xml_declaration=True, pretty_print=True)
-        
-        return Response(
-            content=xml_content,
-            media_type="application/xml; charset=utf-8",
-            headers={
-                "DAV": "1, 2, 3, calendar-access",
-                "Content-Type": "application/xml; charset=utf-8"
-            }
-        )
-    except Exception as e:
-        print(f"PROPFIND error: {e}")
-        raise HTTPException(status_code=500, detail=f"PROPFIND error: {str(e)}")
-
-@app.api_route("/fixtures/calendar.ics", methods=["OPTIONS"])
-async def caldav_options(request: Request):
-    """Handle CalDAV OPTIONS requests"""
-    return Response(
-        content="",
-        headers={
-            "DAV": "1, 2, 3, calendar-access",
-            "Allow": "GET, HEAD, PUT, PROPFIND, OPTIONS, REPORT",
-            "Content-Type": "text/html; charset=utf-8"
-        }
-    )
-
-@app.api_route("/fixtures/calendar.ics", methods=["REPORT"])
-async def caldav_report(request: Request, credentials = Depends(get_calendar_credentials)):
-    """Handle CalDAV REPORT requests"""
-    try:
-        # Get calendar data
-        calendar_response = await get_fixtures_calendar(include_past=False, venue=None, credentials=credentials)
-        if hasattr(calendar_response, 'body'):
-            ical_content = calendar_response.body.decode('utf-8')
-        else:
-            ical_content = calendar_response.content.decode('utf-8')
-        
-        # Create REPORT response
-        multistatus = etree.Element("{DAV:}multistatus", nsmap={
-            None: "DAV:",
-            'C': "urn:ietf:params:xml:ns:caldav"
-        })
-        
-        response_elem = etree.SubElement(multistatus, "{DAV:}response")
-        href = etree.SubElement(response_elem, "{DAV:}href")
-        href.text = "/fixtures/calendar.ics"
-        
-        propstat = etree.SubElement(response_elem, "{DAV:}propstat")
-        prop = etree.SubElement(propstat, "{DAV:}prop")
-        
-        etag = etree.SubElement(prop, "{DAV:}getetag")
-        etag.text = f'"gaa-fixtures-{CLUB_ID}"'
-        
-        caldata = etree.SubElement(prop, "{urn:ietf:params:xml:ns:caldav}calendar-data")
-        caldata.text = ical_content
-        
-        status = etree.SubElement(propstat, "{DAV:}status")
-        status.text = "HTTP/1.1 200 OK"
-        
-        xml_content = etree.tostring(multistatus, encoding='utf-8', xml_declaration=True, pretty_print=True)
-        
-        return Response(
-            content=xml_content,
-            media_type="application/xml; charset=utf-8",
-            headers={
-                "DAV": "1, 2, 3, calendar-access",
-                "Content-Type": "application/xml; charset=utf-8"
-            }
-        )
-        
-    except Exception as e:
-        print(f"REPORT error: {e}")
-        # Return empty response on error
-        multistatus = etree.Element("{DAV:}multistatus", nsmap={None: "DAV:"})
-        xml_content = etree.tostring(multistatus, encoding='utf-8', xml_declaration=True)
-        
-        return Response(
-            content=xml_content,
-            media_type="application/xml; charset=utf-8",
-            headers={
-                "DAV": "1, 2, 3, calendar-access"
-            }
-        )
-
-# Principal/user discovery endpoints
-@app.api_route("/", methods=["PROPFIND"])
-@app.api_route("/fixtures/", methods=["PROPFIND"])
-async def caldav_root_propfind(request: Request, credentials = Depends(get_calendar_credentials)):
-    """Handle root PROPFIND for CalDAV discovery"""
-    try:
-        multistatus = etree.Element("{DAV:}multistatus", nsmap={
-            None: "DAV:",
-            'C': "urn:ietf:params:xml:ns:caldav"
-        })
-        
-        response_elem = etree.SubElement(multistatus, "{DAV:}response")
-        href = etree.SubElement(response_elem, "{DAV:}href")
-        href.text = "/"
-        
-        propstat = etree.SubElement(response_elem, "{DAV:}propstat")
-        prop = etree.SubElement(propstat, "{DAV:}prop")
-        
-        principal = etree.SubElement(prop, "{DAV:}current-user-principal")
-        principal_href = etree.SubElement(principal, "{DAV:}href")
-        principal_href.text = "/fixtures/calendar.ics"
-        
-        resourcetype = etree.SubElement(prop, "{DAV:}resourcetype")
-        collection = etree.SubElement(resourcetype, "{DAV:}collection")
-        
-        status = etree.SubElement(propstat, "{DAV:}status")
-        status.text = "HTTP/1.1 200 OK"
-        
-        xml_content = etree.tostring(multistatus, encoding='utf-8', xml_declaration=True, pretty_print=True)
-        
-        return Response(
-            content=xml_content,
-            media_type="application/xml; charset=utf-8",
-            headers={
-                "DAV": "1, 2, 3, calendar-access",
-                "Content-Type": "application/xml; charset=utf-8"
-            }
-        )
-    except Exception as e:
-        print(f"Root PROPFIND error: {e}")
-        raise HTTPException(status_code=500, detail=f"Root PROPFIND error: {str(e)}")
+# Remote Calendar endpoint - optimized for Home Assistant remote calendar integration
 
 
 if __name__ == "__main__":
