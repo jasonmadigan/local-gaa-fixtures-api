@@ -22,17 +22,45 @@ logger = logging.getLogger(__name__)
 def parse_gaa_date(date_str: str) -> str:
     """Parse GAA date format to ISO date string for sorting"""
     try:
-        # Remove ordinal suffixes (st, nd, rd, th)
+        # handle date ranges like "2025-08-01 - 2025-08-03"
+        if ' - ' in date_str and re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+            start_date = date_str.split(' - ')[0].strip()
+            # validate it's a proper ISO date
+            datetime.strptime(start_date, "%Y-%m-%d")
+            return start_date
+
+        # remove ordinal suffixes (st, nd, rd, th)
         cleaned = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
-        
-        # Parse the date
+
+        # parse the date
         parsed_date = datetime.strptime(cleaned, "%A %d %b %Y")
-        
-        # Return ISO format for easy sorting
+
+        # return ISO format for easy sorting
         return parsed_date.strftime("%Y-%m-%d")
     except Exception as e:
         logger.warning(f"Could not parse date '{date_str}': {e}")
-        return "9999-12-31"  # Put unparseable dates at the end
+        return "9999-12-31"  # unparseable dates at the end
+
+def expand_date_range(date_str: str) -> List[str]:
+    """Expand date ranges into individual dates"""
+    # handle ISO date ranges like "2025-08-01 - 2025-08-03"
+    if ' - ' in date_str and re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+        try:
+            start_str, end_str = date_str.split(' - ')
+            start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
+            end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
+
+            dates = []
+            current = start_date
+            while current <= end_date:
+                dates.append(current.strftime("%Y-%m-%d"))
+                current += timedelta(days=1)
+            return dates
+        except Exception as e:
+            logger.warning(f"Could not expand date range '{date_str}': {e}")
+            return [date_str]
+
+    return [date_str]
 
 @dataclass
 class Fixture:
@@ -111,36 +139,35 @@ class GAAFixturesParser:
         """Parse HTML content to extract fixtures"""
         soup = BeautifulSoup(html_content, 'html.parser')
         fixtures = []
-        
+
         # Find all date headers
         date_headers = soup.find_all('h3', class_='fix_res_date')
-        
+
         for date_header in date_headers:
             date = date_header.get_text().strip()
-            
+
             # Find all competitions after this date header
             current_element = date_header.find_next_sibling()
-            
+
             while current_element and current_element.name != 'h3':
                 if current_element.name == 'div' and 'competition' in current_element.get('class', []):
-                    fixture = self._parse_competition_block(date, current_element)
-                    if fixture:
-                        fixtures.append(fixture)
-                
+                    parsed_fixtures = self._parse_competition_block(date, current_element)
+                    fixtures.extend(parsed_fixtures)
+
                 current_element = current_element.find_next_sibling()
-        
+
         logger.info(f"Parsed {len(fixtures)} fixtures")
         return fixtures
     
-    def _parse_competition_block(self, date: str, competition_div) -> Optional[Fixture]:
-        """Parse a single competition block"""
+    def _parse_competition_block(self, date: str, competition_div) -> List[Fixture]:
+        """Parse a single competition block, expanding date ranges into multiple fixtures"""
         try:
             # Extract competition name
             competition_name_elem = competition_div.find('div', class_='competition-name')
             if not competition_name_elem:
-                return None
+                return []
             competition = competition_name_elem.get_text().strip()
-            
+
             # Extract home team
             home_team_elem = competition_div.find('div', class_='home_team')
             home_team = ""
@@ -148,7 +175,7 @@ class GAAFixturesParser:
                 home_team_link = home_team_elem.find('a')
                 if home_team_link:
                     home_team = home_team_link.get_text().strip()
-            
+
             # Extract away team
             away_team_elem = competition_div.find('div', class_='away_team')
             away_team = ""
@@ -156,45 +183,52 @@ class GAAFixturesParser:
                 away_team_link = away_team_elem.find('a')
                 if away_team_link:
                     away_team = away_team_link.get_text().strip()
-            
+
             # Extract time
             time_elem = competition_div.find('div', class_='time')
             time = ""
             if time_elem:
                 time = time_elem.get_text().strip()
-            
+
             # Extract venue and referee info
             venue = ""
             referee = ""
             more_info_elem = competition_div.find('div', class_='more_info')
             if more_info_elem:
                 venue_text = more_info_elem.get_text()
-                
+
                 # Extract venue
                 venue_match = re.search(r'Venue:\s*([^R]+?)(?:\s+Referee:|$)', venue_text)
                 if venue_match:
                     venue = venue_match.group(1).strip()
-                
+
                 # Extract referee
                 referee_match = re.search(r'Referee:\s*(.+)', venue_text)
                 if referee_match:
                     referee = referee_match.group(1).strip()
-            
-            return Fixture(
-                date=date,
-                competition=competition,
-                home_team=home_team,
-                away_team=away_team,
-                time=time,
-                venue=venue,
-                referee=referee,
-                raw_html=str(competition_div),
-                created_at=datetime.now().isoformat()
-            )
-            
+
+            # expand date ranges into individual dates
+            dates = expand_date_range(date)
+            fixtures = []
+
+            for expanded_date in dates:
+                fixtures.append(Fixture(
+                    date=expanded_date,
+                    competition=competition,
+                    home_team=home_team,
+                    away_team=away_team,
+                    time=time,
+                    venue=venue,
+                    referee=referee,
+                    raw_html=str(competition_div),
+                    created_at=datetime.now().isoformat()
+                ))
+
+            return fixtures
+
         except Exception as e:
             logger.error(f"Error parsing competition block: {e}")
-            return None
+            return []
     
     def save_fixtures(self, fixtures: List[Fixture]):
         """Save fixtures to SQLite database"""
