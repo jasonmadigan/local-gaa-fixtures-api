@@ -41,7 +41,7 @@ The `/fixtures` endpoint supports these optional parameters:
 The application is configured via environment variables:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|-|-|-|
 | `CLUB_ID` | `Dicksboro` | GAA Club ID |
 | `COUNTY_BOARD_ID` | `15` | County Board ID |
 | `DB_PATH` | `fixtures.db` | SQLite database file path |
