@@ -1,376 +1,111 @@
 # GAA Fixtures API
 
-A REST API service that fetches and serves GAA fixtures data from Kilkenny GAA website. The service is configurable per club and can be containerised for easy deployment.
+Caches GAA fixtures for chosen venues or teams from a county board website (kilkennygaa.ie by default) and serves them as a REST API and an iCal feed, for example to Home Assistant's Remote Calendar.
 
-## Features
-
-- 🏆 Fetches fixtures data from GAA website
-- 📊 SQLite database for caching and persistence
-- 🚀 FastAPI-based REST API
-- 🐳 Docker support
-- ⚙️ Configurable per club via environment variables
-- 🔄 Automatic background refresh of fixtures data
-- 📈 Health checks and monitoring endpoints
-- 🏠 Home Assistant Remote Calendar integration
-- 📅 iCal format for calendar applications
-
-## API Endpoints
-
-- `GET /health` - Health check with service status
-- `GET /fixtures` - Get all fixtures (with pagination and filtering)
-- `GET /fixtures/{id}` - Get specific fixture by ID
-- `GET /fixtures/competitions` - Get list of available competitions
-- `GET /fixtures/by-competition/{competition}` - Get fixtures for specific competition
-- `GET /fixtures/venues` - Get list of available venues
-- `GET /fixtures/by-venue/{venue}` - Get fixtures for specific venue
-- `GET /fixtures/calendar.ics` - iCal calendar feed for Home Assistant integration
-- `POST /fixtures/refresh` - Manually trigger fixtures refresh
-
-### Query Parameters
-
-The `/fixtures` endpoint supports these optional parameters:
-- `limit` (default: 50) - Number of fixtures to return
-- `offset` (default: 0) - Number of fixtures to skip (for pagination)
-- `include_past` (default: false) - Include past fixtures (by default only shows today and future)
-- `venue` - Filter by venue name (partial match)
-
-**Note:** By default, all endpoints only return fixtures for today and future dates. This is because the GAA website drops games shortly before they start, so our cache preserves this important data.
+The site drops games from its fixtures list around throw-in, so the service keeps its own copy in SQLite and refreshes it hourly.
 
 ## Configuration
 
-The application is configured via environment variables:
-
 | Variable | Default | Description |
 |-|-|-|
-| `CLUB_ID` | `Dicksboro` | GAA Club ID |
-| `COUNTY_BOARD_ID` | `15` | County Board ID |
-| `DB_PATH` | `fixtures.db` | SQLite database file path |
-| `FETCH_INTERVAL_MINUTES` | `60` | How often to refresh fixtures (minutes) |
-| `PORT` | `8000` | API server port |
+| `VENUE_IDS` | | Comma-separated venue UUIDs |
+| `TEAM_IDS` | | Comma-separated team (club) UUIDs |
+| `SITE_URL` | `https://kilkennygaa.ie` | County board site |
+| `SITE_TIMEZONE` | `Europe/Dublin` | Timezone of the times the site shows |
+| `DB_PATH` | `fixtures.db` | SQLite database; `/app/data/fixtures.db` in the image |
+| `FETCH_INTERVAL_MINUTES` | `60` | How often to read the site |
+| `STALE_AFTER_MINUTES` | 3 × fetch interval | `/health` fails once no sync has succeeded for this long |
+| `PORT` | `8000` | Listen port |
 
-## Quick Start
+Set at least one of `VENUE_IDS` or `TEAM_IDS`. The UUID is the last part of a venue or team page address under Fix & Res on the site, for example `https://kilkennygaa.ie/fixtures-results/venue/upmc-nowlan-park/2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66/`. Some venues have more than one page; list every UUID.
 
-### Local Development with uv (Recommended)
+### Upgrading from 1.x
 
-1. **Install dependencies:**
-   ```bash
-   uv sync
-   ```
+`CLUB_ID` and `COUNTY_BOARD_ID` no longer work because the site retired that feed, and 2.0 refuses to start with only those set. An existing 1.x database is kept as table `fixtures_legacy` beside the new one.
 
-2. **Set environment variables (optional):**
-   ```bash
-   export CLUB_ID=Dicksboro
-   export COUNTY_BOARD_ID=15
-   ```
+## Running
 
-3. **Run the API server:**
-   ```bash
-   uv run python api.py
-   ```
+```bash
+uv sync
+VENUE_IDS=2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66 uv run python api.py
+```
 
-4. **Access the API:**
-   - API: http://localhost:8000
-   - Interactive docs: http://localhost:8000/docs
-   - Health check: http://localhost:8000/health
+Docker. Mount `/app/data` so the cache survives container updates:
 
-### Local Development with pip
+```bash
+docker run -d --name gaa-fixtures -p 8000:8000 \
+  -e VENUE_IDS=2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66,5f960223-d8d6-43e6-be8f-50e77522e689 \
+  -v "$(pwd)/data:/app/data" \
+  ghcr.io/jasonmadigan/local-gaa-fixtures-api:latest
+```
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. **Set environment variables (optional):**
-   ```bash
-   export CLUB_ID=Dicksboro
-   export COUNTY_BOARD_ID=15
-   ```
-
-3. **Run the API server:**
-   ```bash
-   python api.py
-   ```
-
-### Docker
-
-1. **Build the image:**
-   ```bash
-   docker build -t gaa-fixtures-api .
-   ```
-
-2. **Run the container:**
-   ```bash
-   docker run -d \
-     --name gaa-fixtures \
-     -p 8000:8000 \
-     -e CLUB_ID=Dicksboro \
-     -e COUNTY_BOARD_ID=15 \
-     -v $(pwd)/data:/app/data \
-     gaa-fixtures-api
-   ```
-
-3. **Access the API:**
-   - API: http://localhost:8000
-   - Health check: http://localhost:8000/health
-
-### Docker Compose
-
-Create a `docker-compose.yml` file:
+Docker Compose:
 
 ```yaml
-version: '3.8'
-
 services:
   gaa-fixtures-api:
-    build: .
+    image: ghcr.io/jasonmadigan/local-gaa-fixtures-api:latest
     ports:
       - "8000:8000"
     environment:
-      - CLUB_ID=Dicksboro
-      - COUNTY_BOARD_ID=15
-      - FETCH_INTERVAL_MINUTES=60
+      VENUE_IDS: 2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66
     volumes:
       - ./data:/app/data
     restart: unless-stopped
 ```
 
-Run with:
-```bash
-docker-compose up -d
-```
+Run one process per database: each process runs its own sync loop.
 
-## API Usage Examples
+## API
 
-### Get all upcoming fixtures (default behavior)
-```bash
-curl "http://localhost:8000/fixtures?limit=10"
-```
+- `GET /health`: sync status. 503 when the last successful sync is older than `STALE_AFTER_MINUTES`.
+- `GET /fixtures`: fixtures from today on. `limit` (50), `offset` (0), `include_past` (false), `venue` (partial match).
+- `GET /fixtures/{id}`
+- `GET /fixtures/venues`, `GET /fixtures/competitions`
+- `GET /fixtures/by-venue/{venue}`, `GET /fixtures/by-competition/{competition}`: same paging and `include_past`.
+- `GET /fixtures/calendar.ics`: iCal feed. `include_past`, `venue`.
+- `POST /fixtures/refresh`: sync now.
 
-### Include past fixtures (if needed)
-```bash
-curl "http://localhost:8000/fixtures?include_past=true&limit=10"
-```
+Interactive docs are at `/docs`.
 
-### Get fixtures for a specific competition
-```bash
-curl "http://localhost:8000/fixtures/by-competition/Minor%20Hurling%20League"
-```
+A future fixture that disappears from the site (postponed or moved) is hidden after two successful syncs without it, but not within a day of its start. A failed sync leaves the cache as it was and shows in `/health`.
 
-### Get fixtures at a specific venue
-```bash
-curl "http://localhost:8000/fixtures/by-venue/Nowlan%20Park"
-```
+## Calendar feed
 
-### Filter fixtures by venue (using query parameter)
-```bash
-curl "http://localhost:8000/fixtures?venue=Nowlan%20Park&limit=5"
-```
+Each fixture is a two-hour event with UTC times. A fixture without a confirmed time is an all-day event. Event UIDs depend only on the fixture, so a rebuilt database does not duplicate events in calendar clients.
 
-### Get all available venues
-```bash
-curl "http://localhost:8000/fixtures/venues"
-```
+## Home Assistant
 
-### Get service health
-```bash
-curl "http://localhost:8000/health"
-```
+Add the Remote Calendar integration with `http://<host>:8000/fixtures/calendar.ics`, optionally with `?venue=<name>`.
 
-### Get iCal calendar feed
-```bash
-curl "http://localhost:8000/fixtures/calendar.ics"
-```
-
-### Get home fixtures only (iCal)
-```bash
-curl "http://localhost:8000/fixtures/calendar.ics?venue=Nowlan%20Park"
-```
-
-### Manually refresh fixtures
-```bash
-curl -X POST "http://localhost:8000/fixtures/refresh"
-```
-
-## Home Assistant Integration
-
-### Remote Calendar Integration (Recommended)
-
-1. In Home Assistant, go to **Settings** → **Devices & Services**
-2. Click **Add Integration** and search for **"Remote Calendar"**
-3. Enter the URL: `http://your-server-ip:8000/fixtures/calendar.ics`
-4. No authentication required for local deployments
-
-### Legacy iCal Integration (configuration.yaml)
-
-Add this to your Home Assistant `configuration.yaml`:
+Remote Calendar only re-reads the feed once a day. To pick up short-notice fixtures and time changes sooner, refresh the entity from an automation:
 
 ```yaml
-calendar:
-  - platform: ical
-    name: "GAA Fixtures"
-    url: "http://your-server-ip:8000/fixtures/calendar.ics"
-```
-
-### Separate Home/Away Calendars
-
-Create separate calendars for home and away games:
-
-```yaml
-calendar:
-  - platform: ical
-    name: "GAA Home Games"
-    url: "http://your-server-ip:8000/fixtures/calendar.ics?venue=Nowlan%20Park"
-  
-  - platform: ical
-    name: "GAA All Fixtures" 
-    url: "http://your-server-ip:8000/fixtures/calendar.ics"
-```
-
-### Troubleshooting
-
-If you get "failed to connect":
-1. **Check network connectivity**: Ensure Home Assistant can reach your API server
-2. **Use IP instead of hostname**: `http://192.168.1.100:8000/fixtures/calendar.ics`
-3. **Check firewall**: Ensure port 8000 is accessible
-4. **Test in browser**: Visit the URL directly to verify it works
-
-## Database Schema
-
-The SQLite database contains a single `fixtures` table:
-
-```sql
-CREATE TABLE fixtures (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    competition TEXT NOT NULL,
-    home_team TEXT NOT NULL,
-    away_team TEXT NOT NULL,
-    time TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    referee TEXT NOT NULL,
-    raw_html TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(date, competition, home_team, away_team, time)
-);
-```
-
-## Finding Your Club and County Board IDs
-
-To configure the API for your club:
-
-1. Visit your club's fixtures page on the GAA website
-2. Look at the URL parameters in the AJAX request (use browser dev tools)
-3. Find `clubID` and `countyBoardID` parameters
-4. Set these as environment variables
-
-Example URL format:
-```
-https://kilkennygaa.ie/fixtures-results/fixtures-results-ajax/?clubID=XXXX&countyBoardID=XX&fixturesOnly=Y
+- alias: GAA calendar refresh
+  triggers:
+    - trigger: time_pattern
+      minutes: /15
+  actions:
+    - action: homeassistant.update_entity
+      target:
+        entity_id: calendar.gaa
 ```
 
 ## Development
 
-### Running Tests
-
-With uv:
 ```bash
-# Install dev dependencies
-uv sync --extra dev
-
-# Run tests
+uv sync
 uv run pytest
+uv run ruff check .
+uv run black --check .
+uv run python gaa_fixtures_parser.py venue 2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66
 ```
 
-With pip:
-```bash
-# Install test dependencies
-pip install pytest pytest-asyncio
+The last command prints the live listing for a venue, which helps when the site's markup changes.
 
-# Run tests
-pytest
-```
+## Releases
 
-### Manual Testing
-
-With uv:
-```bash
-# Test the parser directly
-uv run python gaa_fixtures_parser.py
-
-# Test with different club
-CLUB_ID=1234 COUNTY_BOARD_ID=20 uv run python gaa_fixtures_parser.py
-```
-
-With pip:
-```bash
-# Test the parser directly
-python gaa_fixtures_parser.py
-
-# Test with different club
-CLUB_ID=1234 COUNTY_BOARD_ID=20 python gaa_fixtures_parser.py
-```
-
-## Deployment
-
-### GitHub Actions (CI/CD)
-
-The repository includes a GitHub Action for automated deployments on releases. See `.github/workflows/deploy.yml`.
-
-To create a release:
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-### Production Deployment
-
-For production deployment, consider:
-
-- Using a reverse proxy (nginx)
-- Setting up proper logging
-- Using a production WSGI server (gunicorn)
-- Setting up monitoring and alerting
-- Regular database backups
-
-Example with gunicorn:
-```bash
-pip install gunicorn
-gunicorn -w 4 -k uvicorn.workers.UvicornWorker api:app
-```
-
-## Monitoring
-
-The API includes several endpoints for monitoring:
-
-- Health check: `GET /health`
-- Metrics are available in the health response
-- Docker health checks are configured
-
-## Troubleshooting
-
-### Common Issues
-
-1. **No fixtures found**: Check that CLUB_ID and COUNTY_BOARD_ID are correct
-2. **Database locked**: Ensure only one instance is running, or use different DB_PATH
-3. **Network errors**: Check firewall and network connectivity to GAA website
-4. **Parsing errors**: The GAA website may have changed format - check logs
-
-### Logs
-
-Enable debug logging:
-```bash
-export PYTHONPATH=.
-python -c "import logging; logging.basicConfig(level=logging.DEBUG)"
-python api.py
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make changes
-4. Add tests
-5. Submit a pull request
+Pushes to `main` publish `ghcr.io/jasonmadigan/local-gaa-fixtures-api:latest`, and a `vX.Y.Z` tag publishes that tag. CI runs the linters, the tests and a Docker build first.
 
 ## License
 
