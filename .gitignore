@@ -175,10 +175,9 @@ Desktop.ini
 # Project specific
 fixtures.db
 *.db
-data/
+/data/
 logs/
 *.log
 
 # uv
 .uv/
-uv.lock

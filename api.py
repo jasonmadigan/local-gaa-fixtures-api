@@ -2,606 +2,409 @@
 """
 GAA Fixtures REST API
 
-FastAPI-based REST API to serve GAA fixtures data.
-Configurable via environment variables for different clubs.
+Serves cached fixtures for the configured venues or teams as JSON, and as an
+iCal feed for calendar clients such as Home Assistant's Remote Calendar.
 """
 
-import os
-import sqlite3
-import re
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict
 import asyncio
-from contextlib import asynccontextmanager
+import copy
+import hashlib
+import logging
+import os
+import threading
+from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
 import uvicorn
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import JSONResponse, Response
 from icalendar import Calendar, Event
+from pydantic import BaseModel
+from uvicorn.config import LOGGING_CONFIG
 
-from gaa_fixtures_parser import GAAFixturesParser, parse_gaa_date
-# from caldav_server import CalDAVServer  # Not using the separate CalDAV server
+from fixtures_store import FixtureStore, StoredFixture
+from gaa_fixtures_parser import (
+    DEFAULT_SITE_URL,
+    UUID_RE,
+    FeedClient,
+    FeedError,
+    Scope,
+    fixture_start,
+)
 
-# Configuration from environment variables
-CLUB_ID = os.getenv("CLUB_ID", "Dicksboro")
-COUNTY_BOARD_ID = os.getenv("COUNTY_BOARD_ID", "15")
-DB_PATH = os.getenv("DB_PATH", "fixtures.db")
-FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL_MINUTES", "60"))  # minutes
-PORT = int(os.getenv("PORT", "8000"))
+logger = logging.getLogger(__name__)
 
-# No authentication required for local/home use
+MATCH_LENGTH = timedelta(hours=2)
+RETIRED_SETTINGS = ("CLUB_ID", "COUNTY_BOARD_ID")
+SCOPE_SETTINGS = (("venue", "VENUE_IDS"), ("team", "TEAM_IDS"))
 
-# Pydantic models for API responses
+
+class ConfigError(Exception):
+    """settings the service cannot run with"""
+
+
+def _ids(env: Mapping[str, str], name: str) -> list[str]:
+    ids = [part.strip().lower() for part in env.get(name, "").split(",") if part.strip()]
+    for value in ids:
+        if not UUID_RE.fullmatch(value):
+            raise ConfigError(f"{name}: {value!r} is not a UUID from a venue or team page URL")
+    return ids
+
+
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise ConfigError(f"{name} must be a positive whole number, not {raw!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class Settings:
+    site_url: str
+    scopes: tuple[Scope, ...]
+    db_path: str
+    fetch_interval_minutes: int
+    stale_after_minutes: int
+    timezone: ZoneInfo
+    port: int
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] = os.environ) -> "Settings":
+        scopes = tuple(
+            Scope(kind, value) for kind, name in SCOPE_SETTINGS for value in _ids(env, name)
+        )
+        retired = [name for name in RETIRED_SETTINGS if env.get(name)]
+        if not scopes:
+            hint = "set VENUE_IDS or TEAM_IDS to UUIDs from venue or team page URLs on the site"
+            if retired:
+                verb = "is" if len(retired) == 1 else "are"
+                raise ConfigError(
+                    f"{' and '.join(retired)} {verb} no longer supported, the site retired"
+                    f" that feed: {hint}"
+                )
+            raise ConfigError(hint)
+        if retired:
+            logger.warning("ignoring retired settings %s", ", ".join(retired))
+
+        interval = _positive_int(env, "FETCH_INTERVAL_MINUTES", 60)
+        tz_name = env.get("SITE_TIMEZONE") or "Europe/Dublin"
+        try:
+            timezone = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ConfigError(f"SITE_TIMEZONE {tz_name!r} is not a known timezone") from e
+        return cls(
+            site_url=env.get("SITE_URL") or DEFAULT_SITE_URL,
+            scopes=scopes,
+            db_path=env.get("DB_PATH") or "fixtures.db",
+            fetch_interval_minutes=interval,
+            stale_after_minutes=_positive_int(env, "STALE_AFTER_MINUTES", 3 * interval),
+            timezone=timezone,
+            port=_positive_int(env, "PORT", 8000),
+        )
+
+
+class ScopeModel(BaseModel):
+    kind: str
+    id: str
+
+
 class FixtureResponse(BaseModel):
     id: int
     date: str
+    date_parsed: str
+    time: str
+    sport: str
     competition: str
     home_team: str
     away_team: str
-    time: str
     venue: str
     referee: str
+    status: str
     created_at: str
+    last_seen_at: str
+
 
 class FixturesListResponse(BaseModel):
-    fixtures: List[FixtureResponse]
+    fixtures: list[FixtureResponse]
     total_count: int
-    club_id: str
-    county_board_id: str
+    scopes: list[ScopeModel]
+
 
 class HealthResponse(BaseModel):
     status: str
-    club_id: str
-    county_board_id: str
+    scopes: list[ScopeModel]
     database_path: str
-    last_update: Optional[str]
+    last_update: str | None
+    last_sync_attempt_at: str | None
+    last_sync_success_at: str | None
+    last_sync_error: str | None
+    consecutive_failures: int
     total_fixtures: int
+    upcoming_fixtures: int
 
-# Global parser instance
-parser: Optional[GAAFixturesParser] = None
 
-# CalDAV server instance
-# caldav_server: Optional[CalDAVServer] = None
+def _iso(moment: datetime | None) -> str | None:
+    return moment.astimezone(UTC).isoformat() if moment else None
 
-async def fetch_fixtures_background():
-    """Background task to periodically fetch fixtures"""
-    global parser
-    if parser:
-        try:
-            await asyncio.get_event_loop().run_in_executor(None, parser.run)
-        except Exception as e:
-            print(f"Error fetching fixtures: {e}")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    global parser
-    
-    # Startup
-    parser = GAAFixturesParser(db_path=DB_PATH, club_id=CLUB_ID, county_board_id=COUNTY_BOARD_ID)
-    
-    # Initial fetch
-    try:
-        await asyncio.get_event_loop().run_in_executor(None, parser.run)
-    except Exception as e:
-        print(f"Initial fetch failed: {e}")
-    
-    # Schedule background task
-    task = asyncio.create_task(schedule_background_fetch())
-    
-    yield
-    
-    # Shutdown
-    task.cancel()
+def _fixture_response(f: StoredFixture) -> FixtureResponse:
+    return FixtureResponse(
+        id=f.id,
+        date=f.date,
+        date_parsed=f.date_parsed,
+        time=f.time,
+        sport=f.sport,
+        competition=f.competition,
+        home_team=f.home_team,
+        away_team=f.away_team,
+        venue=f.venue,
+        referee=f.referee,
+        status=f.status,
+        created_at=_iso(f.created_at),
+        last_seen_at=_iso(f.last_seen_at),
+    )
 
-async def schedule_background_fetch():
-    """Schedule periodic background fetching"""
-    while True:
-        await asyncio.sleep(FETCH_INTERVAL * 60)  # Convert minutes to seconds
-        await fetch_fixtures_background()
 
-# Create FastAPI app
-app = FastAPI(
-    title="GAA Fixtures API",
-    description="REST API for GAA fixtures data",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    # Get fixture count and last update from database
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM fixtures")
-        total_fixtures = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT MAX(created_at) FROM fixtures")
-        last_update = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        return HealthResponse(
-            status="healthy",
-            club_id=CLUB_ID,
-            county_board_id=COUNTY_BOARD_ID,
-            database_path=DB_PATH,
-            last_update=last_update,
-            total_fixtures=total_fixtures
+def calendar_ics(fixtures: list[StoredFixture], timezone: ZoneInfo, stamp: datetime) -> bytes:
+    cal = Calendar()
+    cal.add("prodid", "-//local-gaa-fixtures-api//EN")
+    cal.add("version", "2.0")
+    cal.add("calscale", "GREGORIAN")
+    cal.add("method", "PUBLISH")
+    cal.add("x-wr-calname", "GAA Fixtures")
+    for f in fixtures:
+        start, all_day = fixture_start(f.date_parsed, f.time, timezone)
+        event = Event()
+        # derived from the match identity so a rebuilt database keeps the same uids
+        event.add(
+            "uid", f"{hashlib.sha256(f.key.encode()).hexdigest()[:32]}@local-gaa-fixtures-api"
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/fixtures", response_model=FixturesListResponse)
-async def get_fixtures(
-    limit: Optional[int] = 50,
-    offset: Optional[int] = 0,
-    include_past: Optional[bool] = False,
-    venue: Optional[str] = None
-):
-    """Get fixtures with optional pagination and filtering"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Build query based on filters
-        where_conditions = []
-        params = []
-        
-        # By default, only show today and future games (exclude past games)
-        if not include_past:
-            today = datetime.now().strftime("%Y-%m-%d")
-            where_conditions.append("date_parsed >= ?")
-            params.append(today)
-        
-        if venue:
-            where_conditions.append("venue LIKE ?")
-            params.append(f"%{venue}%")
-        
-        where_clause = ""
-        if where_conditions:
-            where_clause = "WHERE " + " AND ".join(where_conditions)
-        
-        # Get total count
-        count_query = f"SELECT COUNT(*) FROM fixtures {where_clause}"
-        cursor.execute(count_query, params)
-        total_count = cursor.fetchone()[0]
-        
-        # Get fixtures with pagination, sorted by parsed date
-        query = f"""
-            SELECT * FROM fixtures 
-            {where_clause}
-            ORDER BY date_parsed ASC, time ASC
-            LIMIT ? OFFSET ?
-        """
-        params.extend([limit, offset])
-        cursor.execute(query, params)
-        
-        fixtures = []
-        for row in cursor.fetchall():
-            fixtures.append(FixtureResponse(
-                id=row['id'],
-                date=row['date'],
-                competition=row['competition'],
-                home_team=row['home_team'],
-                away_team=row['away_team'],
-                time=row['time'],
-                venue=row['venue'],
-                referee=row['referee'],
-                created_at=row['created_at']
-            ))
-        
-        conn.close()
-        
-        return FixturesListResponse(
-            fixtures=fixtures,
-            total_count=total_count,
-            club_id=CLUB_ID,
-            county_board_id=COUNTY_BOARD_ID
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/fixtures/calendar.ics")
-async def get_fixtures_calendar(
-    include_past: Optional[bool] = False,
-    venue: Optional[str] = None
-):
-    """Return fixtures as iCal format for Home Assistant Remote Calendar integration"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Build query based on filters
-        where_conditions = []
-        params = []
-        
-        # By default, only show today and future games
-        if not include_past:
-            today = datetime.now().strftime("%Y-%m-%d")
-            where_conditions.append("date_parsed >= ?")
-            params.append(today)
-        
-        if venue:
-            where_conditions.append("venue LIKE ?")
-            params.append(f"%{venue}%")
-        
-        where_clause = ""
-        if where_conditions:
-            where_clause = "WHERE " + " AND ".join(where_conditions)
-        
-        # Get fixtures
-        query = f"""
-            SELECT * FROM fixtures 
-            {where_clause}
-            ORDER BY date_parsed ASC, time ASC
-            LIMIT 200
-        """
-        cursor.execute(query, params)
-        fixtures = cursor.fetchall()
-        conn.close()
-        
-        # Create iCal calendar
-        cal = Calendar()
-        cal.add('prodid', f'-//GAA Fixtures API Club {CLUB_ID}//EN')
-        cal.add('version', '2.0')
-        cal.add('calscale', 'GREGORIAN')
-        cal.add('method', 'PUBLISH')
-        cal.add('x-wr-calname', f'GAA Fixtures - Club {CLUB_ID}')
-        cal.add('x-wr-caldesc', f'GAA fixtures for club {CLUB_ID}')
-        
-        for fixture in fixtures:
-            event = Event()
-            
-            # Event summary (title)
-            summary = f"{fixture['home_team']} v {fixture['away_team']}"
-            event.add('summary', summary)
-            
-            # Event description
-            description_parts = [
-                f"Competition: {fixture['competition']}",
-                f"Venue: {fixture['venue']}",
-                f"Referee: {fixture['referee']}"
-            ]
-            event.add('description', '\n'.join(description_parts))
-            
-            # Location
-            event.add('location', fixture['venue'])
-            
-            # Parse date/time
-            try:
-                start_dt = parse_gaa_datetime(fixture['date'], fixture['time'])
-                end_dt = start_dt + timedelta(hours=2)  # Assume 2-hour duration
-                
-                event.add('dtstart', start_dt)
-                event.add('dtend', end_dt)
-            except Exception as e:
-                # Skip events with unparseable dates
-                continue
-            
-            # Unique ID
-            event.add('uid', f"gaa-fixture-{fixture['id']}@club-{CLUB_ID}.gaa")
-            
-            # Creation and modification timestamps
-            now = datetime.now()
-            event.add('dtstamp', now)
-            event.add('created', datetime.fromisoformat(fixture['created_at'].replace('Z', '+00:00')))
-            event.add('last-modified', now)
-            
-            # Categories
-            event.add('categories', ['GAA', 'Hurling', 'Football', fixture['competition'].split()[0]])
-            
-            cal.add_component(event)
-        
-        # Return iCal content
-        ical_content = cal.to_ical().decode('utf-8')
-        
-        return Response(
-            content=ical_content,
-            media_type="text/calendar; charset=utf-8",
-            headers={
-                "Content-Disposition": f"inline; filename=gaa-fixtures-club-{CLUB_ID}.ics",
-                "Cache-Control": "max-age=1800",  # Cache for 30 minutes
-                "ETag": f'"gaa-fixtures-{CLUB_ID}-{len(fixtures)}"',
-                "Last-Modified": datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-            }
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Calendar generation error: {str(e)}")
-
-@app.get("/fixtures/venues")
-async def get_venues():
-    """Get list of available venues"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT DISTINCT venue FROM fixtures WHERE venue != '' ORDER BY venue")
-        venues = [row[0] for row in cursor.fetchall()]
-        
-        conn.close()
-        
-        return {"venues": venues}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/fixtures/competitions")
-async def get_competitions():
-    """Get list of available competitions"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT DISTINCT competition FROM fixtures ORDER BY competition")
-        competitions = [row[0] for row in cursor.fetchall()]
-        
-        conn.close()
-        
-        return {"competitions": competitions}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/fixtures/by-venue/{venue}")
-async def get_fixtures_by_venue(
-    venue: str,
-    limit: Optional[int] = 50,
-    offset: Optional[int] = 0,
-    include_past: Optional[bool] = False
-):
-    """Get fixtures for a specific venue"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Build where conditions
-        where_conditions = ["venue LIKE ?"]
-        params = [f"%{venue}%"]
-        
-        # By default, only show today and future games (exclude past games)
-        if not include_past:
-            today = datetime.now().strftime("%Y-%m-%d")
-            where_conditions.append("date_parsed >= ?")
-            params.append(today)
-        
-        where_clause = "WHERE " + " AND ".join(where_conditions)
-        
-        # Get total count
-        cursor.execute(f"SELECT COUNT(*) FROM fixtures {where_clause}", params)
-        total_count = cursor.fetchone()[0]
-        
-        if total_count == 0:
-            raise HTTPException(status_code=404, detail="No fixtures found for this venue")
-        
-        # Get fixtures
-        cursor.execute(f"""
-            SELECT * FROM fixtures 
-            {where_clause}
-            ORDER BY date_parsed ASC, time ASC
-            LIMIT ? OFFSET ?
-        """, params + [limit, offset])
-        
-        fixtures = []
-        for row in cursor.fetchall():
-            fixtures.append(FixtureResponse(
-                id=row['id'],
-                date=row['date'],
-                competition=row['competition'],
-                home_team=row['home_team'],
-                away_team=row['away_team'],
-                time=row['time'],
-                venue=row['venue'],
-                referee=row['referee'],
-                created_at=row['created_at']
-            ))
-        
-        conn.close()
-        
-        return FixturesListResponse(
-            fixtures=fixtures,
-            total_count=total_count,
-            club_id=CLUB_ID,
-            county_board_id=COUNTY_BOARD_ID
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/fixtures/by-competition/{competition}")
-async def get_fixtures_by_competition(
-    competition: str,
-    limit: Optional[int] = 50,
-    offset: Optional[int] = 0,
-    include_past: Optional[bool] = False
-):
-    """Get fixtures for a specific competition"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Build where conditions
-        where_conditions = ["competition = ?"]
-        params = [competition]
-        
-        # By default, only show today and future games (exclude past games)
-        if not include_past:
-            today = datetime.now().strftime("%Y-%m-%d")
-            where_conditions.append("date_parsed >= ?")
-            params.append(today)
-        
-        where_clause = "WHERE " + " AND ".join(where_conditions)
-        
-        # Get total count
-        cursor.execute(f"SELECT COUNT(*) FROM fixtures {where_clause}", params)
-        total_count = cursor.fetchone()[0]
-        
-        if total_count == 0:
-            raise HTTPException(status_code=404, detail="No upcoming fixtures found for this competition")
-        
-        # Get fixtures
-        cursor.execute(f"""
-            SELECT * FROM fixtures 
-            {where_clause}
-            ORDER BY date_parsed ASC, time ASC
-            LIMIT ? OFFSET ?
-        """, params + [limit, offset])
-        
-        fixtures = []
-        for row in cursor.fetchall():
-            fixtures.append(FixtureResponse(
-                id=row['id'],
-                date=row['date'],
-                competition=row['competition'],
-                home_team=row['home_team'],
-                away_team=row['away_team'],
-                time=row['time'],
-                venue=row['venue'],
-                referee=row['referee'],
-                created_at=row['created_at']
-            ))
-        
-        conn.close()
-        
-        return FixturesListResponse(
-            fixtures=fixtures,
-            total_count=total_count,
-            club_id=CLUB_ID,
-            county_board_id=COUNTY_BOARD_ID
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/fixtures/{fixture_id}", response_model=FixtureResponse)
-async def get_fixture(fixture_id: int):
-    """Get a specific fixture by ID"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    try:
-        conn = sqlite3.connect(parser.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM fixtures WHERE id = ?", (fixture_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail="Fixture not found")
-        
-        conn.close()
-        
-        return FixtureResponse(
-            id=row['id'],
-            date=row['date'],
-            competition=row['competition'],
-            home_team=row['home_team'],
-            away_team=row['away_team'],
-            time=row['time'],
-            venue=row['venue'],
-            referee=row['referee'],
-            created_at=row['created_at']
-        )
-        
-    except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.post("/fixtures/refresh")
-async def refresh_fixtures(background_tasks: BackgroundTasks):
-    """Manually trigger fixtures refresh"""
-    global parser
-    
-    if not parser:
-        raise HTTPException(status_code=503, detail="Parser not initialised")
-    
-    background_tasks.add_task(fetch_fixtures_background)
-    
-    return {"message": "Fixtures refresh triggered"}
-
-def parse_gaa_datetime(date_str: str, time_str: str) -> datetime:
-    """Parse GAA date/time format to datetime object"""
-    try:
-        # Remove ordinal suffixes (st, nd, rd, th)
-        cleaned = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
-        
-        # Extract just the date part (remove day name)
-        parts = cleaned.split()
-        if len(parts) >= 4:  # ["Sunday", "15", "Jun", "2025"]
-            date_part = ' '.join(parts[1:])  # "15 Jun 2025"
+        event.add("dtstamp", stamp.astimezone(UTC))
+        event.add("created", f.created_at.astimezone(UTC))
+        event.add("summary", f"{f.home_team} v {f.away_team}")
+        if all_day:
+            event.add("dtstart", start.date())
+            event.add("dtend", start.date() + timedelta(days=1))
         else:
-            date_part = cleaned
-        
-        # Combine date and time
-        full_datetime = f"{date_part} {time_str}"
-        
-        # Parse the datetime
-        return datetime.strptime(full_datetime, "%d %b %Y %H:%M")
-        
-    except Exception as e:
-        # Fallback: use the parsed date from database
-        iso_date = parse_gaa_date(date_str)
-        time_parts = time_str.split(':')
-        hour = int(time_parts[0])
-        minute = int(time_parts[1]) if len(time_parts) > 1 else 0
-        
-        date_obj = datetime.strptime(iso_date, "%Y-%m-%d")
-        return date_obj.replace(hour=hour, minute=minute)
+            event.add("dtstart", start.astimezone(UTC))
+            event.add("dtend", (start + MATCH_LENGTH).astimezone(UTC))
+        if f.venue:
+            event.add("location", f.venue)
+        details = [f"Competition: {f.competition}", f"Venue: {f.venue}", f"Referee: {f.referee}"]
+        if all_day and f.time:
+            details.append(f"Time: {f.time}")
+        event.add("description", "\n".join(details))
+        event.add("categories", ["GAA", f.sport.title()] if f.sport else ["GAA"])
+        cal.add_component(event)
+    return cal.to_ical()
 
-# Remote Calendar endpoint - optimized for Home Assistant remote calendar integration
+
+class Syncer:
+    """one sync at a time; every outcome lands in the store's sync state"""
+
+    def __init__(
+        self,
+        client: FeedClient,
+        store: FixtureStore,
+        scopes: tuple[Scope, ...],
+        now: Callable[[], datetime],
+    ):
+        self._client = client
+        self._store = store
+        self._scopes = scopes
+        self._now = now
+        self._lock = threading.Lock()
+
+    def run(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            logger.info("sync already in progress")
+            return
+        try:
+            self._sync()
+        finally:
+            self._lock.release()
+
+    def _sync(self) -> None:
+        started = self._now()
+        try:
+            listings = [self._client.fetch(s, "fixtures") for s in self._scopes]
+            listings += [self._client.fetch(s, "results", max_pages=1) for s in self._scopes]
+            summary = self._store.apply_sync(listings, started)
+        except Exception as e:
+            expected = isinstance(e, FeedError)
+            message = str(e) if expected else f"{type(e).__name__}: {e}"
+            logger.error("sync failed: %s", message, exc_info=not expected)
+            try:
+                self._store.record_failure(started, message)
+            except Exception:
+                logger.exception("could not record the sync failure")
+            return
+        logger.info("sync ok: %d listed, %d no longer listed", summary.listed, summary.removed)
+
+
+async def _every(seconds: float, job: Callable[[], None]) -> None:
+    while True:
+        await asyncio.sleep(seconds)
+        await asyncio.to_thread(job)
+
+
+def create_app(
+    settings: Settings | None = None,
+    client: FeedClient | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> FastAPI:
+    settings = settings or Settings.from_env()
+    now = now or (lambda: datetime.now(UTC))
+    store = FixtureStore(settings.db_path, settings.timezone)
+    syncer = Syncer(client or FeedClient(settings.site_url), store, settings.scopes, now)
+    scopes = [ScopeModel(kind=s.kind, id=s.id) for s in settings.scopes]
+
+    def today() -> date:
+        return now().astimezone(settings.timezone).date()
+
+    def listing(fixtures: list[StoredFixture], total: int) -> FixturesListResponse:
+        return FixturesListResponse(
+            fixtures=[_fixture_response(f) for f in fixtures], total_count=total, scopes=scopes
+        )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await asyncio.to_thread(syncer.run)
+        task = asyncio.create_task(_every(settings.fetch_interval_minutes * 60, syncer.run))
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(
+        title="GAA Fixtures API",
+        description="REST API and iCal feed for GAA fixtures",
+        version="2.0.0",
+        lifespan=lifespan,
+    )
+
+    @app.get("/health", response_model=HealthResponse, responses={503: {"model": HealthResponse}})
+    def health() -> JSONResponse:
+        state = store.sync_state()
+        total, upcoming = store.counts(today())
+        fresh = state.last_success_at is not None and now() - state.last_success_at <= timedelta(
+            minutes=settings.stale_after_minutes
+        )
+        body = HealthResponse(
+            status="healthy" if fresh else "unhealthy",
+            scopes=scopes,
+            database_path=settings.db_path,
+            last_update=_iso(state.last_success_at),
+            last_sync_attempt_at=_iso(state.last_attempt_at),
+            last_sync_success_at=_iso(state.last_success_at),
+            last_sync_error=state.last_error,
+            consecutive_failures=state.consecutive_failures,
+            total_fixtures=total,
+            upcoming_fixtures=upcoming,
+        )
+        return JSONResponse(body.model_dump(), status_code=200 if fresh else 503)
+
+    @app.get("/fixtures", response_model=FixturesListResponse)
+    def get_fixtures(
+        limit: int = 50, offset: int = 0, include_past: bool = False, venue: str | None = None
+    ):
+        fixtures, total = store.list_fixtures(
+            today=today(), include_past=include_past, venue=venue, limit=limit, offset=offset
+        )
+        return listing(fixtures, total)
+
+    # played fixtures stay in the feed so calendars keep their history
+    @app.get("/fixtures/calendar.ics")
+    def get_fixtures_calendar(include_past: bool = True, venue: str | None = None) -> Response:
+        fixtures, _ = store.list_fixtures(
+            today=today(), include_past=include_past, venue=venue, limit=None
+        )
+        return Response(
+            content=calendar_ics(fixtures, settings.timezone, now()),
+            media_type="text/calendar; charset=utf-8",
+            headers={"Content-Disposition": "inline; filename=gaa-fixtures.ics"},
+        )
+
+    @app.get("/fixtures/venues")
+    def get_venues():
+        return {"venues": store.venues()}
+
+    @app.get("/fixtures/competitions")
+    def get_competitions():
+        return {"competitions": store.competitions()}
+
+    @app.get("/fixtures/by-venue/{venue}", response_model=FixturesListResponse)
+    def get_fixtures_by_venue(
+        venue: str, limit: int = 50, offset: int = 0, include_past: bool = False
+    ):
+        fixtures, total = store.list_fixtures(
+            today=today(), include_past=include_past, venue=venue, limit=limit, offset=offset
+        )
+        if total == 0:
+            raise HTTPException(status_code=404, detail="No fixtures found for this venue")
+        return listing(fixtures, total)
+
+    @app.get("/fixtures/by-competition/{competition}", response_model=FixturesListResponse)
+    def get_fixtures_by_competition(
+        competition: str, limit: int = 50, offset: int = 0, include_past: bool = False
+    ):
+        fixtures, total = store.list_fixtures(
+            today=today(),
+            include_past=include_past,
+            competition=competition,
+            limit=limit,
+            offset=offset,
+        )
+        if total == 0:
+            raise HTTPException(
+                status_code=404, detail="No upcoming fixtures found for this competition"
+            )
+        return listing(fixtures, total)
+
+    @app.get("/fixtures/{fixture_id}", response_model=FixtureResponse)
+    def get_fixture(fixture_id: int):
+        fixture = store.get_fixture(fixture_id)
+        if fixture is None:
+            raise HTTPException(status_code=404, detail="Fixture not found")
+        return _fixture_response(fixture)
+
+    @app.post("/fixtures/refresh")
+    def refresh_fixtures(background_tasks: BackgroundTasks):
+        background_tasks.add_task(syncer.run)
+        return {"message": "Fixtures refresh triggered"}
+
+    return app
+
+
+class QuietHealthChecks(logging.Filter):
+    """the container health check polls every 30s; keep it out of the access log"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return '"GET /health ' not in record.getMessage()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    try:
+        settings = Settings.from_env()
+    except ConfigError as e:
+        raise SystemExit(f"configuration error: {e}") from e
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config.setdefault("filters", {})["quiet_health"] = {"()": QuietHealthChecks}
+    log_config["handlers"]["access"]["filters"] = ["quiet_health"]
+    uvicorn.run(create_app(settings), host="0.0.0.0", port=settings.port, log_config=log_config)
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "api:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=False
-    )
+    main()
