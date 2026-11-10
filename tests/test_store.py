@@ -110,6 +110,12 @@ def test_two_meetings_of_the_same_teams_on_one_day_are_both_kept(store):
     assert [f.time for f in listed(store)] == ["14:00", "18:00"]
 
 
+def test_fixture_repeated_within_a_listing_is_stored_once(store):
+    store.apply_sync([[make_fixture(), make_fixture()]], NOW)
+
+    assert len(listed(store, include_past=True)) == 1
+
+
 def test_result_replaces_fixture_status(store):
     store.apply_sync([[make_fixture(status="fixture")]], NOW)
 

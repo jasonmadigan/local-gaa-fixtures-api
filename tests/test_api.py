@@ -141,6 +141,23 @@ def test_unexpected_sync_error_is_reported_and_later_syncs_still_run(tmp_path):
     assert recovered.status_code == 200
 
 
+def test_scope_with_no_fixtures_or_results_is_flagged(tmp_path, caplog):
+    with running(tmp_path, FakeSite(), Clock(T0)):
+        pass
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(VENUE_ID in message for message in warnings)
+
+
+def test_scope_with_only_results_is_not_flagged(tmp_path, caplog):
+    site = FakeSite(results=[listing(("Monday 9th Nov 2026", [block()]))])
+
+    with running(tmp_path, site, Clock(T0)):
+        pass
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 @pytest.mark.parametrize(
     ("date_header", "time", "now", "dtstart", "dtend"),
     [

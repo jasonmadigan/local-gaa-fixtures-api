@@ -216,12 +216,15 @@ class FixtureStore:
         """record one complete, successful read of every listing"""
         merged: dict[str, Fixture] = {}
         for listing in listings:
-            occurrences: dict[str, int] = {}
+            seen: dict[str, list[Fixture]] = {}
             for fixture in listing:
                 base = fixture_key(fixture)
-                occurrences[base] = occurrences.get(base, 0) + 1
-                count = occurrences[base]
-                merged[base if count == 1 else f"{base}#{count}"] = fixture
+                same_teams = seen.setdefault(base, [])
+                if fixture in same_teams:
+                    # listed twice, e.g. when the pages shifted while being read
+                    continue
+                same_teams.append(fixture)
+                merged[base if len(same_teams) == 1 else f"{base}#{len(same_teams)}"] = fixture
 
         stamp = _iso(now)
         with closing(self._connect()) as conn, conn:

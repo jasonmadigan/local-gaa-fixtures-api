@@ -103,6 +103,16 @@ def test_block_without_team_elements_is_an_error():
         parse_listing(html, "fixture")
 
 
+@pytest.mark.parametrize("slot", ["time", "more_info"])
+def test_block_missing_its_time_or_venue_line_is_an_error(slot):
+    html = read_data("fixtures_listing.html").replace(
+        f'<div class="{slot}', '<div class="renamed', 1
+    )
+
+    with pytest.raises(FeedError, match="Saturday 14th Nov 2026"):
+        parse_listing(html, "fixture")
+
+
 def test_unparseable_date_header_is_an_error():
     html = read_data("fixtures_listing.html").replace("Saturday 14th Nov 2026", "Saturday TBC", 1)
 

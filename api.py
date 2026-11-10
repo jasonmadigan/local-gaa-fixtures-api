@@ -236,9 +236,9 @@ class Syncer:
     def _sync(self) -> None:
         started = self._now()
         try:
-            listings = [self._client.fetch(s, "fixtures") for s in self._scopes]
-            listings += [self._client.fetch(s, "results", max_pages=1) for s in self._scopes]
-            summary = self._store.apply_sync(listings, started)
+            upcoming = [self._client.fetch(s, "fixtures") for s in self._scopes]
+            played = [self._client.fetch(s, "results", max_pages=1) for s in self._scopes]
+            summary = self._store.apply_sync(upcoming + played, started)
         except Exception as e:
             expected = isinstance(e, FeedError)
             message = str(e) if expected else f"{type(e).__name__}: {e}"
@@ -249,6 +249,9 @@ class Syncer:
                 logger.exception("could not record the sync failure")
             return
         logger.info("sync ok: %d listed, %d no longer listed", summary.listed, summary.removed)
+        for scope, fixtures, results in zip(self._scopes, upcoming, played, strict=True):
+            if not fixtures and not results:
+                logger.warning("%s lists no fixtures or results; check the id", scope)
 
 
 async def _every(seconds: float, job: Callable[[], None]) -> None:
@@ -290,7 +293,7 @@ def create_app(
     app = FastAPI(
         title="GAA Fixtures API",
         description="REST API and iCal feed for GAA fixtures",
-        version="2.0.0",
+        version="2.0.1",
         lifespan=lifespan,
     )
 
