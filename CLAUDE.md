@@ -29,7 +29,7 @@ Caches GAA fixtures for configured venues or teams from a county board site (kil
 
 ## iCal
 
-Times are UTC instants of the site's local times. An unknown time gives an all-day event. UIDs come from the fixture identity, so a rebuilt database keeps them.
+The feed keeps played fixtures (`include_past` defaults to true here, unlike the JSON endpoints). Times are UTC instants of the site's local times. An unknown time gives an all-day event. UIDs come from the fixture identity, so a rebuilt database keeps them.
 
 ## Development
 

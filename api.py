@@ -324,8 +324,9 @@ def create_app(
         )
         return listing(fixtures, total)
 
+    # played fixtures stay in the feed so calendars keep their history
     @app.get("/fixtures/calendar.ics")
-    def get_fixtures_calendar(include_past: bool = False, venue: str | None = None) -> Response:
+    def get_fixtures_calendar(include_past: bool = True, venue: str | None = None) -> Response:
         fixtures, _ = store.list_fixtures(
             today=today(), include_past=include_past, venue=venue, limit=None
         )

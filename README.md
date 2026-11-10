@@ -63,7 +63,7 @@ Run one process per database: each process runs its own sync loop.
 - `GET /fixtures/{id}`
 - `GET /fixtures/venues`, `GET /fixtures/competitions`
 - `GET /fixtures/by-venue/{venue}`, `GET /fixtures/by-competition/{competition}`: same paging and `include_past`.
-- `GET /fixtures/calendar.ics`: iCal feed. `include_past`, `venue`.
+- `GET /fixtures/calendar.ics`: iCal feed including played fixtures. `include_past=false` limits it to today on; `venue` filters.
 - `POST /fixtures/refresh`: sync now.
 
 Interactive docs are at `/docs`.
@@ -72,7 +72,7 @@ A future fixture that disappears from the site (postponed or moved) is hidden af
 
 ## Calendar feed
 
-Each fixture is a two-hour event with UTC times. A fixture without a confirmed time is an all-day event. Event UIDs depend only on the fixture, so a rebuilt database does not duplicate events in calendar clients.
+Each fixture is a two-hour event with UTC times, and played fixtures stay in the feed so calendars keep their history. A fixture without a confirmed time is an all-day event. Event UIDs depend only on the fixture, so a rebuilt database does not duplicate events in calendar clients.
 
 ## Home Assistant
 

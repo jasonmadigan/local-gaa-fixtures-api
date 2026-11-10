@@ -180,7 +180,8 @@ def test_calendar_fixture_without_a_time_is_an_all_day_event(tmp_path):
 
 def test_calendar_uids_survive_a_database_rebuild(tmp_path):
     def uids(http):
-        return [line for line in calendar_lines(http) if line.startswith("UID:")]
+        lines = calendar_lines(http, include_past="false")
+        return [line for line in lines if line.startswith("UID:")]
 
     site = FakeSite(fixtures=[read_data("fixtures_listing.html")])
     with running(tmp_path, site, Clock(T0), db="first.db") as http:
@@ -210,6 +211,26 @@ def test_calendar_drops_a_fixture_the_site_no_longer_lists(tmp_path):
         lines = calendar_lines(http)
 
     assert "BEGIN:VEVENT" not in lines
+
+
+def test_calendar_keeps_played_fixtures_unless_asked_for_upcoming_only(tmp_path):
+    site = FakeSite(
+        fixtures=[
+            listing(
+                ("Monday 9th Nov 2026", [block(home=("Clara", None))]),
+                ("Sunday 15th Nov 2026", [block(home=("Piltown", None))]),
+            )
+        ]
+    )
+
+    with running(tmp_path, site, Clock(T0)) as http:
+        everything = calendar_lines(http)
+        upcoming = calendar_lines(http, include_past="false")
+
+    assert "SUMMARY:Clara v James Stephens" in everything
+    assert "SUMMARY:Piltown v James Stephens" in everything
+    assert "SUMMARY:Clara v James Stephens" not in upcoming
+    assert "SUMMARY:Piltown v James Stephens" in upcoming
 
 
 def test_calendar_venue_filter_matches_part_of_the_name(tmp_path):
