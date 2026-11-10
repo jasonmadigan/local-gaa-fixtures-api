@@ -134,9 +134,7 @@ def _competition(element: Tag) -> tuple[str, str, str]:
     return _text(link), _uuid_in(link["href"]), sport
 
 
-def _more_info(element: Tag | None) -> tuple[str, str, str]:
-    if element is None:
-        return "", "", ""
+def _more_info(element: Tag) -> tuple[str, str, str]:
     text = _text(element)
     referee = re.search(r"Referee:\s*(.*)$", text)
     link = element.find("a", href=re.compile(r"/fixtures-results/venue/"))
@@ -152,7 +150,9 @@ def _parse_block(block: Tag, date_text: str, status: str) -> list[Fixture]:
     name = block.find("div", class_="competition-name")
     home = block.find("div", class_="home_team")
     away = block.find("div", class_="away_team")
-    if name is None or home is None or away is None:
+    time = block.find("div", class_="time")
+    info = block.find("div", class_="more_info")
+    if any(part is None for part in (name, home, away, time, info)):
         raise FeedError(f"unrecognised fixture block under {date_text!r}")
     try:
         dates = expand_date_range(date_text)
@@ -163,14 +163,13 @@ def _parse_block(block: Tag, date_text: str, status: str) -> list[Fixture]:
     competition, competition_id, sport = _competition(name)
     home_team, home_team_id = _team(home)
     away_team, away_team_id = _team(away)
-    time = block.find("div", class_="time")
-    venue, venue_id, referee = _more_info(block.find("div", class_="more_info"))
+    venue, venue_id, referee = _more_info(info)
     raw_html = str(block)
     return [
         Fixture(
             date=shown,
             date_parsed=iso,
-            time=_text(time) if time is not None else "",
+            time=_text(time),
             sport=sport,
             competition=competition,
             competition_id=competition_id,

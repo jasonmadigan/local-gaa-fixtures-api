@@ -1,6 +1,6 @@
 [project]
 name = "gaa-fixtures-api"
-version = "2.0.0"
+version = "2.0.1"
 description = "REST API and iCal feed for GAA fixtures"
 requires-python = ">=3.11"
 dependencies = [
