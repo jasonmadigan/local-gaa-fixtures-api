@@ -297,7 +297,7 @@ def create_app(
     app = FastAPI(
         title="GAA Fixtures API",
         description="REST API and iCal feed for GAA fixtures",
-        version="2.0.2",
+        version="2.0.3",
         lifespan=lifespan,
     )
 

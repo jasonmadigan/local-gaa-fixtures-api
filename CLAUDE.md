@@ -41,7 +41,7 @@ uv run ruff check .
 uv run black .
 ```
 
-Python is pinned to 3.11 in `.python-version` to match the image; pydantic 2.5 has no wheels for 3.13. `httpx` stays below 0.28 while starlette is 0.27, whose TestClient breaks on 0.28.
+Python is pinned to 3.11 in `.python-version` to match the image. Starlette's TestClient uses `httpx2`; with plain `httpx` it warns that support is going.
 
 Use neutral examples (UPMC Nowlan Park, Dicksboro) in code, docs, tests and commit messages. Real deployment IDs belong only in deployment configuration.
 
