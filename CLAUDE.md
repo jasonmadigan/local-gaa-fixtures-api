@@ -25,11 +25,12 @@ Caches GAA fixtures for configured venues or teams from a county board site (kil
 - Each sync reads every fixtures page and the first results page, so a played fixture keeps its row.
 - A future fixture missing from the listings is hidden after two successful syncs without it, never within 24 hours of its start. Past rows stay.
 - A failed sync changes no fixtures; it is recorded in `sync_state`.
+- A scope that lists no fixtures and no results fails the sync. The site answers an unknown UUID with its normal empty listing, so this is the only sign of a wrong or re-keyed id.
 - `/health` returns 503 unless a sync succeeded within `STALE_AFTER_MINUTES`. The Docker health check depends on that status code.
 
 ## iCal
 
-The feed keeps played fixtures (`include_past` defaults to true here, unlike the JSON endpoints). Times are UTC instants of the site's local times. An unknown time gives an all-day event. UIDs come from the fixture identity, so a rebuilt database keeps them.
+The feed keeps played fixtures (`include_past` defaults to true here, unlike the JSON endpoints). Times are UTC instants of the site's local times. An unknown time gives an all-day event. Walkovers (time `Conceded`) are left out because no match is played; the JSON endpoints keep them. UIDs come from the fixture identity, so a rebuilt database keeps them.
 
 ## Development
 

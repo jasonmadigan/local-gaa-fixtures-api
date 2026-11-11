@@ -17,7 +17,15 @@ The site drops games from its fixtures list around throw-in, so the service keep
 | `STALE_AFTER_MINUTES` | 3 × fetch interval | `/health` fails once no sync has succeeded for this long |
 | `PORT` | `8000` | Listen port |
 
-Set at least one of `VENUE_IDS` or `TEAM_IDS`. The UUID is the last part of a venue or team page address under Fix & Res on the site, for example `https://kilkennygaa.ie/fixtures-results/venue/upmc-nowlan-park/2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66/`. Some venues have more than one page; list every UUID.
+Set at least one of `VENUE_IDS` or `TEAM_IDS`. The UUID is the last part of a venue or team page address under Fix & Res on the site, for example `https://kilkennygaa.ie/fixtures-results/venue/upmc-nowlan-park/2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66/` or `https://kilkennygaa.ie/fixtures-results/team/dicksboro/9aa42b31-882e-c039-965f-3c4923ce1421/`. Some venues have more than one page; list every UUID. A team UUID belongs to the club, so it covers the club's B teams too.
+
+| Setting | UUID | Covers |
+|-|-|-|
+| `VENUE_IDS` | `2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66` | UPMC Nowlan Park |
+| `VENUE_IDS` | `5f960223-d8d6-43e6-be8f-50e77522e689` | UPMC Nowlan Park, second page |
+| `TEAM_IDS` | `9aa42b31-882e-c039-965f-3c4923ce1421` | Dicksboro, including its B teams |
+
+A venue or team that lists no fixtures and no results fails the sync and shows in `/health`, because that is how the site answers a UUID it does not know.
 
 ### Upgrading from 1.x
 
@@ -72,7 +80,7 @@ A future fixture that disappears from the site (postponed or moved) is hidden af
 
 ## Calendar feed
 
-Each fixture is a two-hour event with UTC times, and played fixtures stay in the feed so calendars keep their history. A fixture without a confirmed time is an all-day event. Event UIDs depend only on the fixture, so a rebuilt database does not duplicate events in calendar clients.
+Each fixture is a two-hour event with UTC times, and played fixtures stay in the feed so calendars keep their history. A fixture without a confirmed time is an all-day event. Walkovers are left out, since no match is played; the JSON endpoints still list them, with time `Conceded`. Event UIDs depend only on the fixture, so a rebuilt database does not duplicate events in calendar clients.
 
 ## Home Assistant
 
@@ -91,6 +99,31 @@ Remote Calendar only re-reads the feed once a day. To pick up short-notice fixtu
         entity_id: calendar.gaa
 ```
 
+A calendar trigger, such as a reminder before each fixture, arms only if the calendar entity exists when Home Assistant starts its automations, and is not retried. If the API is unreachable then, Remote Calendar adds the entity later and the trigger stays unarmed until the next restart. Re-arm it when the calendar comes back:
+
+```yaml
+- alias: GAA reminder re-arm
+  triggers:
+    - trigger: state
+      entity_id: calendar.gaa
+      from: unavailable
+  conditions:
+    - condition: state
+      entity_id: automation.gaa_fixture_reminder
+      state: "on"
+  actions:
+    - action: automation.turn_off
+      target:
+        entity_id: automation.gaa_fixture_reminder
+      data:
+        stop_actions: false
+    - action: automation.turn_on
+      target:
+        entity_id: automation.gaa_fixture_reminder
+```
+
+An all-day event starts at midnight, so check `trigger.calendar_event.all_day` before a reminder shows a time.
+
 ## Development
 
 ```bash
@@ -99,9 +132,10 @@ uv run pytest
 uv run ruff check .
 uv run black --check .
 uv run python gaa_fixtures_parser.py venue 2e69ec4d-97e3-4b7f-b4a5-e0b60666ad66
+uv run python gaa_fixtures_parser.py team 9aa42b31-882e-c039-965f-3c4923ce1421 --results
 ```
 
-The last command prints the live listing for a venue, which helps when the site's markup changes.
+The last two commands print the live listing for a venue or a team, which helps when checking an id or when the site's markup changes.
 
 ## Releases
 

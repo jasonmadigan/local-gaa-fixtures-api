@@ -141,21 +141,37 @@ def test_unexpected_sync_error_is_reported_and_later_syncs_still_run(tmp_path):
     assert recovered.status_code == 200
 
 
-def test_scope_with_no_fixtures_or_results_is_flagged(tmp_path, caplog):
-    with running(tmp_path, FakeSite(), Clock(T0)):
-        pass
+def test_scope_with_no_fixtures_or_results_fails_the_sync(tmp_path):
+    with running(tmp_path, FakeSite(), Clock(T0)) as http:
+        response = http.get("/health")
 
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any(VENUE_ID in message for message in warnings)
+    assert response.status_code == 503
+    assert VENUE_ID in response.json()["last_sync_error"]
 
 
-def test_scope_with_only_results_is_not_flagged(tmp_path, caplog):
+def test_scope_that_goes_empty_keeps_its_fixtures(tmp_path):
+    site = one_fixture_site("Sunday 15th Nov 2026")
+    clock = Clock(T0)
+
+    with running(tmp_path, site, clock) as http:
+        site.pages["fixtures"] = [read_data("no_fixtures.html")]
+        for _ in range(3):
+            clock.advance(minutes=60)
+            http.post("/fixtures/refresh")
+        lines = calendar_lines(http)
+        health = http.get("/health").json()
+
+    assert "SUMMARY:Dicksboro v James Stephens" in lines
+    assert health["consecutive_failures"] == 3
+
+
+def test_scope_with_only_results_syncs(tmp_path):
     site = FakeSite(results=[listing(("Monday 9th Nov 2026", [block()]))])
 
-    with running(tmp_path, site, Clock(T0)):
-        pass
+    with running(tmp_path, site, Clock(T0)) as http:
+        response = http.get("/health")
 
-    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize(
@@ -195,6 +211,20 @@ def test_calendar_fixture_without_a_time_is_an_all_day_event(tmp_path):
     assert "DTEND;VALUE=DATE:20261122" in lines
 
 
+def test_calendar_leaves_out_walkovers(tmp_path):
+    walkover = block(away=("Clara (C)", None), time="Conceded")
+    played = block(home=("Piltown", None))
+    site = FakeSite(results=[listing(("Sunday 8th Nov 2026", [walkover, played]))])
+
+    with running(tmp_path, site, Clock(T0)) as http:
+        lines = calendar_lines(http)
+        listed = http.get("/fixtures", params={"include_past": "true"}).json()["fixtures"]
+
+    assert "SUMMARY:Piltown v James Stephens" in lines
+    assert not [line for line in lines if "Clara" in line]
+    assert "Clara (C)" in [f["away_team"] for f in listed]
+
+
 def test_calendar_uids_survive_a_database_rebuild(tmp_path):
     def uids(http):
         lines = calendar_lines(http, include_past="false")
@@ -217,17 +247,19 @@ def test_calendar_uids_survive_a_database_rebuild(tmp_path):
 
 def test_calendar_drops_a_fixture_the_site_no_longer_lists(tmp_path):
     site = one_fixture_site("Sunday 15th Nov 2026")
+    site.pages["results"] = [listing(("Sunday 8th Nov 2026", [block(home=("Piltown", None))]))]
     clock = Clock(T0)
 
     with running(tmp_path, site, clock) as http:
-        assert "BEGIN:VEVENT" in calendar_lines(http)
+        assert "SUMMARY:Dicksboro v James Stephens" in calendar_lines(http)
         site.pages["fixtures"] = [read_data("no_fixtures.html")]
         for _ in range(2):
             clock.advance(minutes=60)
             http.post("/fixtures/refresh")
         lines = calendar_lines(http)
 
-    assert "BEGIN:VEVENT" not in lines
+    assert "SUMMARY:Dicksboro v James Stephens" not in lines
+    assert "SUMMARY:Piltown v James Stephens" in lines
 
 
 def test_calendar_keeps_played_fixtures_unless_asked_for_upcoming_only(tmp_path):

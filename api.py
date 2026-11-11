@@ -33,6 +33,7 @@ from gaa_fixtures_parser import (
     FeedError,
     Scope,
     fixture_start,
+    is_walkover,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,6 +183,8 @@ def calendar_ics(fixtures: list[StoredFixture], timezone: ZoneInfo, stamp: datet
     cal.add("method", "PUBLISH")
     cal.add("x-wr-calname", "GAA Fixtures")
     for f in fixtures:
+        if is_walkover(f.time):
+            continue
         start, all_day = fixture_start(f.date_parsed, f.time, timezone)
         event = Event()
         # derived from the match identity so a rebuilt database keeps the same uids
@@ -238,6 +241,10 @@ class Syncer:
         try:
             upcoming = [self._client.fetch(s, "fixtures") for s in self._scopes]
             played = [self._client.fetch(s, "results", max_pages=1) for s in self._scopes]
+            for scope, fixtures, results in zip(self._scopes, upcoming, played, strict=True):
+                # the site answers an unknown id with its normal empty listing
+                if not fixtures and not results:
+                    raise FeedError(f"{scope} lists no fixtures or results; check the id")
             summary = self._store.apply_sync(upcoming + played, started)
         except Exception as e:
             expected = isinstance(e, FeedError)
@@ -249,9 +256,6 @@ class Syncer:
                 logger.exception("could not record the sync failure")
             return
         logger.info("sync ok: %d listed, %d no longer listed", summary.listed, summary.removed)
-        for scope, fixtures, results in zip(self._scopes, upcoming, played, strict=True):
-            if not fixtures and not results:
-                logger.warning("%s lists no fixtures or results; check the id", scope)
 
 
 async def _every(seconds: float, job: Callable[[], None]) -> None:
@@ -293,7 +297,7 @@ def create_app(
     app = FastAPI(
         title="GAA Fixtures API",
         description="REST API and iCal feed for GAA fixtures",
-        version="2.0.1",
+        version="2.0.2",
         lifespan=lifespan,
     )
 
