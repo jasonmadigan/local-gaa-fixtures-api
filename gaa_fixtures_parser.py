@@ -102,6 +102,11 @@ def fixture_start(date_parsed: str, time: str, tz: tzinfo) -> tuple[datetime, bo
     return datetime(day.year, day.month, day.day, tzinfo=tz), True
 
 
+def is_walkover(time: str) -> bool:
+    """a side conceded, so no match was played"""
+    return time.strip().lower() == "conceded"
+
+
 def _text(element: Tag) -> str:
     return " ".join(element.get_text(" ", strip=True).split())
 
